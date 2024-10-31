@@ -313,9 +313,8 @@ class Graph(ABC):
         log_probs = 0
         new_features = self.construct_new_features(input['task'])
         logits = self.gcn(new_features,self.role_adj_matrix)
-        self.spatial_logits = logits * logits
+        self.spatial_logits = logits @ logits.t()
         self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
-        print(f"###########logits:{self.spatial_logits}")
 
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
