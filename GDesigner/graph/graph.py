@@ -9,7 +9,7 @@ from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
-from GDesigner.gnn.gcn import GCN
+from GDesigner.gnn.gcn import GCN,MLP
 from torch_geometric.utils import dense_to_sparse
 
 class Graph(ABC):
@@ -76,7 +76,8 @@ class Graph(ABC):
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
         self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
-        
+        self.mlp = MLP(384,16,16)
+
         init_spatial_logit = torch.log(torch.tensor(initial_spatial_probability / (1 - initial_spatial_probability))) if optimized_spatial else 10.0
         # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
         #                                          requires_grad=optimized_spatial) # trainable edge logits
@@ -313,6 +314,7 @@ class Graph(ABC):
         log_probs = 0
         new_features = self.construct_new_features(input['task'])
         logits = self.gcn(new_features,self.role_adj_matrix)
+        logits = self.mlp(logits)
         self.spatial_logits = logits @ logits.t()
         self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
 

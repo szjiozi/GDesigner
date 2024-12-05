@@ -17,3 +17,15 @@ class GCN(torch.nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = self.conv2(x, edge_index)
         return F.log_softmax(x, dim=1)
+
+class MLP(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(MLP, self).__init__()
+        self.fc1 = torch.nn.Linear(input_size, hidden_size)
+        self.fc2 = torch.nn.Linear(hidden_size, output_size)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x

@@ -106,6 +106,7 @@ async def main():
         for i_record, record in enumerate(current_batch):
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
+            realized_graph.mlp = graph.mlp
             task = record["prompt"]
             test = record["test"]
             tests.append(test)

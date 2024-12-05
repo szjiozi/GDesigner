@@ -30,7 +30,7 @@ async def achat(
         'authorization': authorization_key
     }
     data = {
-        "name": model+'-y',
+        "name": model,
         "inputs": {
             "stream": False,
             "msg": repr(msg),

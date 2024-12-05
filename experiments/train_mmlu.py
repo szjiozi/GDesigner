@@ -39,6 +39,7 @@ async def train(graph:Graph,
         for i_record, record in zip(range(batch_size), loader):
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
+            realized_graph.mlp = graph.mlp
             input_dict = dataset.record_to_input(record)
             print(input_dict)
             answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
