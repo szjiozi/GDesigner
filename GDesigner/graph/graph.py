@@ -3,14 +3,31 @@ from typing import Any, List, Optional, Dict, Tuple
 from abc import ABC
 import numpy as np
 import torch
+import torch.nn as nn
+from torch.distributions import Bernoulli
 import asyncio
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
-from GDesigner.gnn.gcn import GCN,MLP
+from GDesigner.gnn.gcn import GCN, MLP
 from torch_geometric.utils import dense_to_sparse
+
+class RefineModule(nn.Module):
+    def __init__(self, num_nodes: int):
+        super().__init__()
+        self.layer1 = nn.Linear(num_nodes, num_nodes)
+        self.layer2 = nn.Linear(num_nodes, num_nodes)
+        self.activation = nn.ReLU()
+        self.output = nn.Sigmoid()
+
+    def forward(self, adjacency: torch.Tensor) -> torch.Tensor:
+        x = self.layer1(adjacency)
+        x = self.activation(x)
+        x = self.layer2(x)
+        x = self.output(x)
+        return 0.5 * (x + x.transpose(0, 1))
 
 class Graph(ABC):
     """
@@ -75,18 +92,32 @@ class Graph(ABC):
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
-        self.gcn = GCN(self.features.size(1)*2,16,self.features.size(1))
-        self.mlp = MLP(384,16,16)
+        self.hidden_dim = 32
+        self.latent_dim = 16
+        self.gumbel_tau = 0.5
 
-        init_spatial_logit = torch.log(torch.tensor(initial_spatial_probability / (1 - initial_spatial_probability))) if optimized_spatial else 10.0
-        # self.spatial_logits = torch.nn.Parameter(torch.ones(len(self.potential_spatial_edges), requires_grad=optimized_spatial) * init_spatial_logit,
-        #                                          requires_grad=optimized_spatial) # trainable edge logits
+        input_dim = self.features.size(1) * 2
+        self.gcn = GCN(input_dim, self.hidden_dim, self.hidden_dim)
+        self.mlp = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim)
+        self.encoder_mu = nn.Linear(self.hidden_dim, self.latent_dim)
+        self.encoder_logvar = nn.Linear(self.hidden_dim, self.latent_dim)
+        self.qs_linear = nn.Linear(self.latent_dim, self.latent_dim)
+        self.refine = RefineModule(self.num_nodes)
+
+        self.mu: Optional[torch.Tensor] = None
+        self.logvar: Optional[torch.Tensor] = None
+        self.latent_z: Optional[torch.Tensor] = None
+        self.tilde_S: Optional[torch.Tensor] = None
+
         self.spatial_masks = torch.nn.Parameter(fixed_spatial_masks,requires_grad=False)  # fixed edge masks
+        self.spatial_edge_probs = torch.full((len(self.potential_spatial_edges),),
+                                             initial_spatial_probability,
+                                             dtype=torch.float32)
 
-        init_temporal_logit = torch.log(torch.tensor(initial_temporal_probability / (1 - initial_temporal_probability))) if optimized_temporal else 10.0
-        self.temporal_logits = torch.nn.Parameter(torch.ones(len(self.potential_temporal_edges), requires_grad=optimized_temporal) * init_temporal_logit,
-                                                 requires_grad=optimized_temporal) # trainable edge logits
         self.temporal_masks = torch.nn.Parameter(fixed_temporal_masks,requires_grad=False)  # fixed edge masks
+        self.temporal_edge_probs = torch.full((len(self.potential_temporal_edges),),
+                                              initial_temporal_probability,
+                                              dtype=torch.float32)
     
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -216,9 +247,10 @@ class Graph(ABC):
 
     def construct_spatial_connection(self, temperature: float = 1.0, threshold: float = None,): # temperature must >= 1.0
         self.clear_spatial_connection()
-        log_probs = [torch.tensor(0.0, requires_grad=self.optimized_spatial)]
-        
-        for potential_connection, edge_logit, edge_mask in zip(self.potential_spatial_edges, self.spatial_logits, self.spatial_masks):
+        device = self.spatial_edge_probs.device
+        log_probs = [torch.tensor(0.0, device=device)]
+
+        for idx, (potential_connection, edge_mask) in enumerate(zip(self.potential_spatial_edges, self.spatial_masks)):
             out_node:Node = self.find_node(potential_connection[0])
             in_node:Node = self.find_node(potential_connection[1])
             if edge_mask == 0.0:
@@ -228,23 +260,27 @@ class Graph(ABC):
                     out_node.add_successor(in_node,'spatial')
                 continue
             if not self.check_cycle(in_node, {out_node}):
-                edge_prob = torch.sigmoid(edge_logit / temperature)
+                edge_prob = self.spatial_edge_probs[idx]
+                edge_prob = torch.sigmoid(torch.logit(edge_prob, eps=1e-6) / temperature)
                 if threshold:
-                    edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
-                if torch.rand(1) < edge_prob:
+                    hard_value = 1.0 if edge_prob.item() > threshold else 0.0
+                    edge_prob = torch.tensor(hard_value, dtype=edge_prob.dtype, device=device)
+                edge_prob = torch.clamp(edge_prob, min=1e-6, max=1 - 1e-6)
+                bernoulli = Bernoulli(probs=edge_prob)
+                sample = bernoulli.sample()
+                if sample.item() == 1.0:
                     out_node.add_successor(in_node,'spatial')
-                    log_probs.append(torch.log(edge_prob))
-                else:
-                    log_probs.append(torch.log(1 - edge_prob))
-                    
+                log_probs.append(bernoulli.log_prob(sample))
+
         return torch.sum(torch.stack(log_probs))
-    
+
     def construct_temporal_connection(self, round:int = 0, temperature: float = 1.0, threshold: float = None,):  # temperature must >= 1.0
         self.clear_temporal_connection()
-        log_probs = [torch.tensor(0.0, requires_grad=self.optimized_temporal)]
+        device = self.temporal_edge_probs.device
+        log_probs = [torch.tensor(0.0, device=device)]
         if round == 0:
-            return torch.sum(torch.stack(log_probs))  
-        for potential_connection, edge_logit, edge_mask in zip(self.potential_temporal_edges, self.temporal_logits, self.temporal_masks):
+            return torch.sum(torch.stack(log_probs))
+        for idx, (potential_connection, edge_mask) in enumerate(zip(self.potential_temporal_edges, self.temporal_masks)):
             out_node:Node = self.find_node(potential_connection[0])
             in_node:Node = self.find_node(potential_connection[1])
             if edge_mask == 0.0:
@@ -253,16 +289,19 @@ class Graph(ABC):
                 if not self.check_cycle(in_node, {out_node}):
                     out_node.add_successor(in_node,'temporal')
                 continue
-            
-            edge_prob = torch.sigmoid(edge_logit / temperature)
+
+            edge_prob = self.temporal_edge_probs[idx]
+            edge_prob = torch.sigmoid(torch.logit(edge_prob, eps=1e-6) / temperature)
             if threshold:
-                edge_prob = torch.tensor(1 if edge_prob > threshold else 0)
-            if torch.rand(1) < edge_prob:
+                hard_value = 1.0 if edge_prob.item() > threshold else 0.0
+                edge_prob = torch.tensor(hard_value, dtype=edge_prob.dtype, device=device)
+            edge_prob = torch.clamp(edge_prob, min=1e-6, max=1 - 1e-6)
+            bernoulli = Bernoulli(probs=edge_prob)
+            sample = bernoulli.sample()
+            if sample.item() == 1.0:
                 out_node.add_successor(in_node,'temporal')
-                log_probs.append(torch.log(edge_prob))
-            else:
-                log_probs.append(torch.log(1 - edge_prob))
-                    
+            log_probs.append(bernoulli.log_prob(sample))
+
         return torch.sum(torch.stack(log_probs))
 
 
@@ -272,6 +311,9 @@ class Graph(ABC):
                   max_time: int = 600,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
+        if isinstance(inputs, dict) and 'task' in inputs:
+            self.prepare_probabilities(inputs['task'])
+
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
             log_probs += self.construct_temporal_connection(round)
@@ -312,11 +354,7 @@ class Graph(ABC):
                   max_time: int = 600,) -> List[Any]:
         # inputs:{'task':"xxx"}
         log_probs = 0
-        new_features = self.construct_new_features(input['task'])
-        logits = self.gcn(new_features,self.role_adj_matrix)
-        logits = self.mlp(logits)
-        self.spatial_logits = logits @ logits.t()
-        self.spatial_logits = min_max_norm(torch.flatten(self.spatial_logits))
+        self.prepare_probabilities(input['task'])
 
         for round in range(num_rounds):
             log_probs += self.construct_spatial_connection()
@@ -350,6 +388,41 @@ class Graph(ABC):
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
         return final_answers, log_probs
+
+    def encode(self, query: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        new_features = self.construct_new_features(query)
+        latent_features = self.gcn(new_features, self.role_adj_matrix)
+        latent_features = self.mlp(latent_features)
+        mu = self.encoder_mu(latent_features)
+        logvar = self.encoder_logvar(latent_features)
+        return mu, logvar
+
+    def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def qs(self, latent: torch.Tensor, tau: float) -> torch.Tensor:
+        transformed = self.qs_linear(latent)
+        similarity = torch.matmul(transformed, transformed.transpose(0, 1))
+        if self.qs_linear.training:
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(similarity) + 1e-9) + 1e-9)
+            logits = (similarity + gumbel_noise) / tau
+            return torch.sigmoid(logits)
+        return torch.sigmoid(similarity)
+
+    def qc(self, sketch_adj: torch.Tensor) -> torch.Tensor:
+        refined = self.refine(sketch_adj)
+        return refined
+
+    def prepare_probabilities(self, query: str) -> None:
+        self.mu, self.logvar = self.encode(query)
+        self.latent_z = self.reparameterize(self.mu, self.logvar)
+        sketch_adj = self.qs(self.latent_z, self.gumbel_tau)
+        self.tilde_S = self.qc(sketch_adj)
+        flat_probs = torch.clamp(self.tilde_S, min=1e-6, max=1 - 1e-6).reshape(-1)
+        self.spatial_edge_probs = flat_probs
+        self.temporal_edge_probs = flat_probs
     
     def update_memory(self):
         for id,node in self.nodes.items():
@@ -367,30 +440,24 @@ class Graph(ABC):
         if self.optimized_spatial:
             num_edges = (self.spatial_masks > 0).sum()
             num_masks = (self.spatial_masks == 0).sum()
-            prune_num_edges = torch.round(num_edges*pruning_rate) if torch.round(num_edges*pruning_rate)>0 else 1
-            _edge_logits = self.spatial_logits.clone()
-            min_edge_logit = _edge_logits.min()
-            _edge_logits[self.spatial_masks == 0] = min_edge_logit - 1.0
-            sorted_edges_idx = torch.argsort(_edge_logits)
-            prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
-            self.spatial_masks[prune_idx] = 0
-        
+            if num_edges.item() > 0:
+                prune_target = torch.round(num_edges * pruning_rate)
+                prune_num_edges = int(prune_target.item()) if prune_target.item() > 0 else 1
+                edge_scores = self.spatial_edge_probs.clone().detach()
+                edge_scores = torch.where(self.spatial_masks > 0, edge_scores, torch.tensor(1.0, dtype=edge_scores.dtype, device=edge_scores.device))
+                sorted_edges_idx = torch.argsort(edge_scores)
+                prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks.item())]
+                self.spatial_masks[prune_idx] = 0
+
         if self.optimized_temporal:
             num_edges = (self.temporal_masks > 0).sum()
             num_masks = (self.temporal_masks == 0).sum()
-            prune_num_edges = torch.round(num_edges*pruning_rate) if torch.round(num_edges*pruning_rate)>0 else 1
-            _edge_logits = self.temporal_logits.clone()
-            min_edge_logit = _edge_logits.min()
-            _edge_logits[self.temporal_masks == 0] = min_edge_logit - 1.0
-            sorted_edges_idx = torch.argsort(_edge_logits)
-            prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks)]
-            self.temporal_masks[prune_idx] = 0
+            if num_edges.item() > 0:
+                prune_target = torch.round(num_edges * pruning_rate)
+                prune_num_edges = int(prune_target.item()) if prune_target.item() > 0 else 1
+                edge_scores = self.temporal_edge_probs.clone().detach()
+                edge_scores = torch.where(self.temporal_masks > 0, edge_scores, torch.tensor(1.0, dtype=edge_scores.dtype, device=edge_scores.device))
+                sorted_edges_idx = torch.argsort(edge_scores)
+                prune_idx = sorted_edges_idx[:int(prune_num_edges + num_masks.item())]
+                self.temporal_masks[prune_idx] = 0
         return self.spatial_masks, self.temporal_masks
-
-def min_max_norm(tensor:torch.Tensor):
-    min_val = tensor.min()
-    max_val = tensor.max()
-    normalized_0_to_1 = (tensor - min_val) / (max_val - min_val)
-    normalized_minus1_to_1 = normalized_0_to_1 * 2 - 1
-    return normalized_minus1_to_1
-    

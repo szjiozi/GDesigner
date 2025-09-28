@@ -28,8 +28,21 @@ async def train(graph:Graph,
     
     loader = infinite_data_loader()
     
-    optimizer = torch.optim.Adam(graph.gcn.parameters(), lr=lr)    
+    trainable_params = []
+    trainable_params += list(graph.gcn.parameters())
+    trainable_params += list(graph.mlp.parameters())
+    trainable_params += list(graph.encoder_mu.parameters())
+    trainable_params += list(graph.encoder_logvar.parameters())
+    trainable_params += list(graph.qs_linear.parameters())
+    trainable_params += list(graph.refine.parameters())
+    optimizer = torch.optim.Adam(trainable_params, lr=lr)
+
     graph.gcn.train()
+    graph.mlp.train()
+    graph.encoder_mu.train()
+    graph.encoder_logvar.train()
+    graph.qs_linear.train()
+    graph.refine.train()
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
@@ -40,6 +53,10 @@ async def train(graph:Graph,
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.encoder_mu = graph.encoder_mu
+            realized_graph.encoder_logvar = graph.encoder_logvar
+            realized_graph.qs_linear = graph.qs_linear
+            realized_graph.refine = graph.refine
             input_dict = dataset.record_to_input(record)
             print(input_dict)
             answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
