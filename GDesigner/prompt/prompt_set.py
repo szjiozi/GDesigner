@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from abc import ABC, abstractmethod
 
 
@@ -89,3 +89,6 @@ class PromptSet(ABC):
     @abstractmethod
     def get_decision_few_shot() ->str:
         """ TODO """
+
+    def get_anchor_topology(self) -> List[Tuple[str, str]]:
+        return self.get_role_connection()

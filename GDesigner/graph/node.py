@@ -1,5 +1,5 @@
 import shortuuid
-from typing import List, Any, Optional,Dict
+from typing import List, Any, Optional, Dict
 from abc import ABC, abstractmethod
 import warnings
 import asyncio
@@ -40,19 +40,20 @@ class Node(ABC):
             An internal medthod to process the raw_input, the spatial info and temporal info to get the final inputs.
     """
 
-    def __init__(self, 
-                 id: Optional[str],
-                 agent_name:str="",
-                 domain:str="", 
-                 llm_name:str = "",
-                 ):
+    def __init__(
+            self,
+            id: Optional[str],
+            agent_name: str = "",
+            domain: str = "",
+            llm_name: str = "",
+    ):
         """
         Initializes a new Node instance.
         """
-        self.id:str = id if id is not None else shortuuid.ShortUUID().random(length=4)
-        self.agent_name:str = agent_name
-        self.domain:str = domain
-        self.llm_name:str = llm_name
+        self.id: str = id if id is not None else shortuuid.ShortUUID().random(length=4)
+        self.agent_name: str = agent_name
+        self.domain: str = domain
+        self.llm_name: str = llm_name
         self.spatial_predecessors: List[Node] = []
         self.spatial_successors: List[Node] = []
         self.temporal_predecessors: List[Node] = []
@@ -61,7 +62,7 @@ class Node(ABC):
         self.outputs: List[Any] = []
         self.raw_inputs: List[Any] = []
         self.role = ""
-        self.last_memory: Dict[str,List[Any]] = {'inputs':[],'outputs':[],'raw_inputs':[]}        
+        self.last_memory: Dict[str, List[Any]] = {'inputs': [], 'outputs': [], 'raw_inputs': []}
 
     @property
     def node_name(self):
@@ -110,7 +111,7 @@ class Node(ABC):
         self.last_memory['outputs'] = self.outputs
         self.last_memory['raw_inputs'] = self.raw_inputs
 
-    def get_spatial_info(self)->Dict[str,Dict]:
+    def get_spatial_info(self) -> Dict[str, Dict]:
         """ Return a dict that maps id to info. """
         spatial_info = {}
         if self.spatial_predecessors is not None:
@@ -126,7 +127,7 @@ class Node(ABC):
 
         return spatial_info
 
-    def get_temporal_info(self)->Dict[str,Any]:
+    def get_temporal_info(self) -> Dict[str, Any]:
         temporal_info = {}
         if self.temporal_predecessors is not None:
             for predecessor in self.temporal_predecessors:
@@ -141,7 +142,7 @@ class Node(ABC):
         
         return temporal_info
     
-    def execute(self, input:Any, **kwargs):
+    def execute(self, input: Any, **kwargs):
         self.outputs = []
         spatial_info:Dict[str,Dict] = self.get_spatial_info()
         temporal_info:Dict[str,Dict] = self.get_temporal_info()
@@ -154,7 +155,7 @@ class Node(ABC):
         return self.outputs
 
 
-    async def async_execute(self, input:Any, **kwargs):
+    async def async_execute(self, input: Any, **kwargs):
 
         self.outputs = []
         spatial_info:Dict[str,Any] = self.get_spatial_info()
@@ -168,16 +169,36 @@ class Node(ABC):
         return self.outputs
                
     @abstractmethod
-    def _execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
+    def _execute(self, input: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
 
     @abstractmethod
-    async def _async_execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
+    async def _async_execute(self, input: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
 
     @abstractmethod
-    def _process_inputs(self, raw_inputs:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs)->List[Any]:
+    def _process_inputs(self, raw_inputs: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs) -> List[Any]:
         """ To be overriden by the descendant class """
         """ Process the raw_inputs(most of the time is a List[Dict]) """
+
+
+class TaskNode(Node):
+    """A lightweight node used to represent the virtual task vertex."""
+
+    def __init__(self, id: Optional[str] = None, domain: str = "", llm_name: str = ""):
+        super().__init__(id=id, agent_name="virtual_task", domain=domain, llm_name=llm_name)
+        self.role = "Virtual Task"
+
+    def _execute(self, input: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs):
+        self.raw_inputs = input if isinstance(input, list) else [input]
+        self.inputs = self.raw_inputs
+        self.outputs = self.raw_inputs
+        return self.outputs
+
+    async def _async_execute(self, input: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs):
+        return self._execute(input, spatial_info, temporal_info, **kwargs)
+
+    def _process_inputs(self, raw_inputs: List[Any], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs) -> List[Any]:
+        return raw_inputs if isinstance(raw_inputs, list) else [raw_inputs]
