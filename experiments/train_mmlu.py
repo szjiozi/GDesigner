@@ -17,6 +17,8 @@ async def train(graph:Graph,
             num_rounds:int=1,
             lr:float=0.1,
             batch_size:int = 4,
+            anchor_weight: float = 1.0,
+            sparse_weight: float = 1.0,
           ) -> None:
     
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -43,11 +45,14 @@ async def train(graph:Graph,
     graph.encoder_logvar.train()
     graph.qs_linear.train()
     graph.refine.train()
+    device = next(graph.gcn.parameters()).device
+
     for i_iter in range(num_iters):
         print(f"Iter {i_iter}", 80*'-')
         start_ts = time.time()
         correct_answers = []
         answer_log_probs = []
+        realized_graphs: List[Graph] = []
 
         for i_record, record in zip(range(batch_size), loader):
             realized_graph = copy.deepcopy(graph)
@@ -57,19 +62,22 @@ async def train(graph:Graph,
             realized_graph.encoder_logvar = graph.encoder_logvar
             realized_graph.qs_linear = graph.qs_linear
             realized_graph.refine = graph.refine
+            realized_graphs.append(realized_graph)
             input_dict = dataset.record_to_input(record)
             print(input_dict)
             answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,num_rounds)))
             correct_answer = dataset.record_to_target_answer(record)
             correct_answers.append(correct_answer)
-        
+
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
         answers: List[str] = []
-        
-        for raw_answer, log_prob, correct_answer in zip(raw_answers, log_probs, correct_answers):
+        anchor_losses: List[torch.Tensor] = []
+        sparse_losses: List[torch.Tensor] = []
+
+        for realized_graph, raw_answer, log_prob, correct_answer in zip(realized_graphs, raw_answers, log_probs, correct_answers):
             answer = dataset.postprocess_answer(raw_answer)
             answers.append(answer)
             assert isinstance(correct_answer, str), \
@@ -81,17 +89,27 @@ async def train(graph:Graph,
             single_loss = - log_prob * utility
             loss_list.append(single_loss)
             print(f"correct answer:{correct_answer}")
-    
-        total_loss = torch.mean(torch.stack(loss_list))
-        optimizer.zero_grad() 
-        total_loss.backward()
+
+            if hasattr(realized_graph, "refine_losses"):
+                anchor_losses.append(realized_graph.refine_losses.get("L_anchor", torch.tensor(0.0, device=device)).to(device))
+                sparse_losses.append(realized_graph.refine_losses.get("L_sparse", torch.tensor(0.0, device=device)).to(device))
+
+        L_utility = torch.mean(torch.stack(loss_list)) if loss_list else torch.tensor(0.0, device=device)
+        L_anchor = torch.mean(torch.stack(anchor_losses)) if anchor_losses else torch.tensor(0.0, device=device)
+        L_sparse = torch.mean(torch.stack(sparse_losses)) if sparse_losses else torch.tensor(0.0, device=device)
+        L_GDesigner = L_utility + anchor_weight * L_anchor + sparse_weight * L_sparse
+        optimizer.zero_grad()
+        L_GDesigner.backward()
         optimizer.step()
 
         print("raw_answers:",raw_answers)
         print("answers:",answers)
         print(f"Batch time {time.time() - start_ts:.3f}")
         print("utilities:", utilities) # [0.0, 0.0, 0.0, 1.0]
-        print("loss:", total_loss.item()) # 4.6237263679504395
+        print("L_utility:", L_utility.item())
+        print("L_anchor:", L_anchor.item())
+        print("L_sparse:", L_sparse.item())
+        print("L_GDesigner:", L_GDesigner.item())
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")

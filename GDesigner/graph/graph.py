@@ -16,19 +16,55 @@ from GDesigner.gnn.node_encoder import NodeEncoder
 from torch_geometric.utils import dense_to_sparse
 
 class RefineModule(nn.Module):
-    def __init__(self, num_nodes: int):
+    def __init__(self, num_nodes: int, rank: Optional[int] = None, zeta: float = 1e-3):
         super().__init__()
-        self.layer1 = nn.Linear(num_nodes, num_nodes)
-        self.layer2 = nn.Linear(num_nodes, num_nodes)
-        self.activation = nn.ReLU()
-        self.output = nn.Sigmoid()
+        max_rank = num_nodes
+        if rank is None:
+            self.rank = max_rank
+        else:
+            self.rank = min(rank, max_rank)
+        if self.rank <= 0:
+            raise ValueError("RefineModule rank must be positive")
+        self.zeta = zeta
+        self.W = nn.Parameter(torch.zeros(self.rank, self.rank))
+        self._latest_losses: Dict[str, torch.Tensor] = {
+            "L_anchor": torch.tensor(0.0),
+            "L_sparse": torch.tensor(0.0),
+            "L_total": torch.tensor(0.0),
+        }
 
-    def forward(self, adjacency: torch.Tensor) -> torch.Tensor:
-        x = self.layer1(adjacency)
-        x = self.activation(x)
-        x = self.layer2(x)
-        x = self.output(x)
-        return 0.5 * (x + x.transpose(0, 1))
+    def _compute_z(self, sketch_adj: torch.Tensor) -> torch.Tensor:
+        # torch.linalg.svd is differentiable w.r.t. sketch_adj
+        u, _, _ = torch.linalg.svd(sketch_adj, full_matrices=False)
+        return u[:, : self.rank]
+
+    def forward(self, sketch_adj: torch.Tensor, anchor_adj: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        anchor_adj = anchor_adj.to(device=sketch_adj.device, dtype=sketch_adj.dtype)
+        Z = self._compute_z(sketch_adj)
+        reconstruction = Z @ self.W @ Z.transpose(0, 1)
+        reconstruction = 0.5 * (reconstruction + reconstruction.transpose(0, 1))
+
+        sparse_residual = sketch_adj - reconstruction
+        anchor_residual = anchor_adj - reconstruction
+
+        L_sparse_recon = 0.5 * torch.norm(sparse_residual, p="fro") ** 2
+        nuclear_norm = torch.linalg.svdvals(self.W).sum()
+        L_sparse = L_sparse_recon + self.zeta * nuclear_norm
+        L_anchor = 0.5 * torch.norm(anchor_residual, p="fro") ** 2
+        L_total = L_sparse + L_anchor
+
+        losses = {
+            "L_anchor": L_anchor,
+            "L_sparse": L_sparse,
+            "L_total": L_total,
+            "Z": Z,
+        }
+        # keep a detached snapshot for logging/inspection without breaking autograd
+        self._latest_losses = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in losses.items()
+        }
+        return reconstruction, losses
 
 class Graph(ABC):
     """
@@ -52,7 +88,7 @@ class Graph(ABC):
         run(inputs, num_steps=10, single_agent=False): Executes the graph for a specified number of steps, processing provided inputs.
     """
 
-    def __init__(self, 
+    def __init__(self,
                 domain: str,
                 llm_name: Optional[str],
                 agent_names: List[str],
@@ -64,6 +100,9 @@ class Graph(ABC):
                 initial_temporal_probability: float = 0.5,
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
+                gumbel_tau: float = 0.5,
+                refine_rank: Optional[int] = None,
+                refine_zeta: float = 1e-3,
                 ):
         
         if fixed_spatial_masks is None:
@@ -124,7 +163,7 @@ class Graph(ABC):
         self.tilde_A_anchor = self.A_anchor
         self.hidden_dim = 32
         self.latent_dim = 16
-        self.gumbel_tau = 0.5
+        self.gumbel_tau = gumbel_tau
 
         input_dim = self.features.size(1) * 2
         self.gcn = GCN(input_dim, self.hidden_dim, self.hidden_dim)
@@ -132,7 +171,12 @@ class Graph(ABC):
         self.encoder_mu = nn.Linear(self.hidden_dim, self.latent_dim)
         self.encoder_logvar = nn.Linear(self.hidden_dim, self.latent_dim)
         self.qs_linear = nn.Linear(self.latent_dim, self.latent_dim)
-        self.refine = RefineModule(self.num_nodes)
+        self.refine = RefineModule(self.num_nodes, rank=refine_rank, zeta=refine_zeta)
+        self.refine_losses: Dict[str, torch.Tensor] = {
+            "L_anchor": torch.tensor(0.0),
+            "L_sparse": torch.tensor(0.0),
+            "L_total": torch.tensor(0.0),
+        }
 
         self.mu: Optional[torch.Tensor] = None
         self.logvar: Optional[torch.Tensor] = None
@@ -501,7 +545,9 @@ class Graph(ABC):
         return torch.sigmoid(similarity)
 
     def qc(self, sketch_adj: torch.Tensor) -> torch.Tensor:
-        refined = self.refine(sketch_adj)
+        refined, losses = self.refine(sketch_adj, self.A_anchor)
+        # store the most recent refine losses for downstream objectives
+        self.refine_losses = {key: value for key, value in losses.items() if key in {"L_anchor", "L_sparse", "L_total"}}
         return refined
 
     def prepare_probabilities(self, query: str) -> None:
