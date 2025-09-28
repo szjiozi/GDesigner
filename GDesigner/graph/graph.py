@@ -7,11 +7,12 @@ import torch.nn as nn
 from torch.distributions import Bernoulli
 import asyncio
 
-from GDesigner.graph.node import Node
+from GDesigner.graph.node import Node, TaskNode
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 from GDesigner.llm.profile_embedding import get_sentence_embedding
 from GDesigner.gnn.gcn import GCN, MLP
+from GDesigner.gnn.node_encoder import NodeEncoder
 from torch_geometric.utils import dense_to_sparse
 
 class RefineModule(nn.Module):
@@ -82,16 +83,45 @@ class Graph(ABC):
         self.optimized_temporal = optimized_temporal
         self.decision_node:Node = AgentRegistry.get(decision_method, **{"domain":self.domain,"llm_name":self.llm_name})
         self.nodes:Dict[str,Node] = {}
+        self.agent_node_ids: List[str] = []
         self.potential_spatial_edges:List[List[str, str]] = []
         self.potential_temporal_edges:List[List[str,str]] = []
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
-        
+        self.task_node = TaskNode(domain=self.domain, llm_name=self.llm_name)
+        self.virtual_task_id: Optional[str] = None
+        self.virtual_task_index: Optional[int] = None
+
         self.init_nodes() # add nodes to the self.nodes
         self.init_potential_edges() # add potential edges to the self.potential_spatial/temporal_edges
-        
+        self.node_order: List[str] = list(self.nodes.keys())
+
+        total_nodes = self.num_nodes
+        num_agents = len(self.agent_names)
+        if fixed_spatial_masks.numel() != total_nodes * total_nodes:
+            spatial_mask_matrix = fixed_spatial_masks.view(num_agents, num_agents)
+            expanded_spatial_mask = torch.ones((total_nodes, total_nodes), dtype=spatial_mask_matrix.dtype)
+            expanded_spatial_mask[:num_agents, :num_agents] = spatial_mask_matrix
+            expanded_spatial_mask.fill_diagonal_(0)
+            fixed_spatial_masks = expanded_spatial_mask.view(-1)
+        else:
+            spatial_mask_matrix = fixed_spatial_masks.view(total_nodes, total_nodes)
+            spatial_mask_matrix.fill_diagonal_(0)
+            fixed_spatial_masks = spatial_mask_matrix.view(-1)
+
+        if fixed_temporal_masks.numel() != total_nodes * total_nodes:
+            temporal_mask_matrix = fixed_temporal_masks.view(num_agents, num_agents)
+            expanded_temporal_mask = torch.ones((total_nodes, total_nodes), dtype=temporal_mask_matrix.dtype)
+            expanded_temporal_mask[:num_agents, :num_agents] = temporal_mask_matrix
+            fixed_temporal_masks = expanded_temporal_mask.view(-1)
+        else:
+            fixed_temporal_masks = fixed_temporal_masks.view(total_nodes, total_nodes).reshape(-1)
+
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role_adj_matrix = self.construct_adj_matrix()
         self.features = self.construct_features()
+        self.node_encoder = NodeEncoder(self.features.size(1), self.features.size(1))
+        self.A_anchor, self.A_anchor_edge_index = self.construct_anchor_adj_matrix()
+        self.tilde_A_anchor = self.A_anchor
         self.hidden_dim = 32
         self.latent_dim = 16
         self.gumbel_tau = 0.5
@@ -123,42 +153,95 @@ class Graph(ABC):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
         num_nodes = self.num_nodes
         role_adj = torch.zeros((num_nodes,num_nodes))
-        role_2_id = {}
-        
-        for edge in role_connect:
-            in_role, out_role = edge
-            role_2_id[in_role] = []
-            role_2_id[out_role] = []
+        role_2_id: Dict[str, List[int]] = {}
+
         for i, node_id in enumerate(self.nodes):
             role = self.nodes[node_id].role
-            role_2_id[role].append(i)
-            
+            role_2_id.setdefault(role, []).append(i)
+
         for edge in role_connect:
             in_role,out_role = edge
-            in_ids = role_2_id[in_role]
-            out_ids = role_2_id[out_role]
+            in_ids = role_2_id.get(in_role, [])
+            out_ids = role_2_id.get(out_role, [])
             for in_id in in_ids:
                 for out_id in out_ids:
                     role_adj[in_id][out_id] = 1
-        
+
         edge_index, edge_weight = dense_to_sparse(role_adj)
         return edge_index
-    
+
     def construct_features(self):
-        features = []
+        features: List[torch.Tensor] = []
+        feature_dim: Optional[int] = None
+
         for node_id in self.nodes:
-            role = self.nodes[node_id].role
-            profile = self.prompt_set.get_description(role)
-            feature = get_sentence_embedding(profile)
-            features.append(feature)
-        features = torch.tensor(np.array(features))
-        return features
-    
+            node = self.nodes[node_id]
+            if node_id == self.virtual_task_id:
+                if feature_dim is None:
+                    placeholder = torch.tensor(np.array(get_sentence_embedding("virtual task")), dtype=torch.float32)
+                    feature_dim = placeholder.size(0)
+                feature_tensor = torch.zeros(feature_dim, dtype=torch.float32)
+            else:
+                role = node.role
+                profile = self.prompt_set.get_description(role)
+                feature_array = get_sentence_embedding(profile)
+                feature_tensor = torch.tensor(np.array(feature_array), dtype=torch.float32)
+                if feature_dim is None:
+                    feature_dim = feature_tensor.size(0)
+            features.append(feature_tensor)
+
+        if not features:
+            return torch.empty((0, 0), dtype=torch.float32)
+        features_tensor = torch.stack(features)
+        return features_tensor
+
     def construct_new_features(self, query):
-        query_embedding = torch.tensor(get_sentence_embedding(query))
-        query_embedding = query_embedding.unsqueeze(0).repeat((self.num_nodes,1))
-        new_features = torch.cat((self.features,query_embedding),dim=1)
+        query_embedding = torch.tensor(np.array(get_sentence_embedding(query)), dtype=torch.float32)
+        query_features: List[torch.Tensor] = []
+
+        for node_id in self.nodes:
+            if node_id == self.virtual_task_id:
+                encoded = self.node_encoder(query_embedding)
+                query_features.append(encoded)
+            else:
+                query_features.append(query_embedding.clone())
+
+        query_feature_tensor = torch.stack(query_features)
+        new_features = torch.cat((self.features, query_feature_tensor), dim=1)
+        self.tilde_X = new_features
         return new_features
+
+    def construct_anchor_adj_matrix(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        anchor_edges: List[Tuple[str, str]] = self.prompt_set.get_anchor_topology()
+        num_nodes = self.num_nodes
+        anchor_adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+        role_2_id: Dict[str, List[int]] = {}
+
+        for i, node_id in enumerate(self.nodes):
+            role = self.nodes[node_id].role
+            role_2_id.setdefault(role, []).append(i)
+
+        for edge in anchor_edges:
+            in_role, out_role = edge
+            in_ids = role_2_id.get(in_role, [])
+            out_ids = role_2_id.get(out_role, [])
+            for in_id in in_ids:
+                for out_id in out_ids:
+                    anchor_adj[in_id][out_id] = 1.0
+
+        if self.virtual_task_id is not None:
+            if self.virtual_task_index is not None:
+                task_index = self.virtual_task_index
+            else:
+                task_index = list(self.nodes.keys()).index(self.virtual_task_id)
+            for idx, node_id in enumerate(self.nodes):
+                if node_id == self.virtual_task_id:
+                    continue
+                anchor_adj[task_index][idx] = 1.0
+                anchor_adj[idx][task_index] = 1.0
+
+        edge_index, _ = dense_to_sparse(anchor_adj)
+        return anchor_adj, edge_index
         
     @property
     def spatial_adj_matrix(self):
@@ -212,7 +295,13 @@ class Graph(ABC):
                 kwargs["domain"] = self.domain
                 kwargs["llm_name"] = self.llm_name
                 agent_instance = AgentRegistry.get(agent_name, **kwargs)
-                self.add_node(agent_instance)
+                added_node = self.add_node(agent_instance)
+                self.agent_node_ids.append(added_node.id)
+
+        if self.task_node is not None:
+            added_task = self.add_node(self.task_node)
+            self.virtual_task_id = added_task.id
+            self.virtual_task_index = len(self.nodes) - 1
     
     def init_potential_edges(self):
         """
