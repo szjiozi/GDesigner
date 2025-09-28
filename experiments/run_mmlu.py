@@ -47,6 +47,16 @@ def parse_args():
                         help="the decision method of the final node")
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
+    parser.add_argument('--gumbel_tau', type=float, default=0.5,
+                        help="Gumbel-Softmax temperature for edge sampling.")
+    parser.add_argument('--refine_rank', type=int, default=None,
+                        help="Rank used in the refine module (default uses full rank).")
+    parser.add_argument('--refine_zeta', type=float, default=1e-3,
+                        help="Nuclear norm regularization strength for the refine module.")
+    parser.add_argument('--anchor_weight', type=float, default=1.0,
+                        help="Weight of the anchor loss during training.")
+    parser.add_argument('--sparse_weight', type=float, default=1.0,
+                        help="Weight of the sparse regularization loss during training.")
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -70,6 +80,9 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
+                  gumbel_tau=args.gumbel_tau,
+                  refine_rank=args.refine_rank,
+                  refine_zeta=args.refine_zeta,
                   **kwargs)
     download()
     dataset_train = MMLUDataset('dev')
@@ -77,7 +90,8 @@ async def main():
     
     if args.optimized_spatial or args.optimized_temporal:
         await train(graph=graph,dataset=dataset_train,num_iters=args.num_iterations,num_rounds=args.num_rounds,
-                    lr=args.lr,batch_size=args.batch_size)
+                    lr=args.lr,batch_size=args.batch_size,
+                    anchor_weight=args.anchor_weight,sparse_weight=args.sparse_weight)
         
     
     score = await evaluate(graph=graph,dataset=dataset_val,num_rounds=args.num_rounds,limit_questions=limit_questions,eval_batch_size=args.batch_size)
