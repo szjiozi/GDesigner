@@ -557,8 +557,10 @@ class Graph(ABC):
         sketch_adj = self.ps(self.latent_z, self.gumbel_tau)
         self.tilde_S = self.qc(sketch_adj)
         flat_probs = torch.clamp(self.tilde_S, min=1e-6, max=1 - 1e-6).reshape(-1)
-        self.spatial_edge_probs = flat_probs
-        self.temporal_edge_probs = flat_probs
+        if self.optimized_spatial:
+            self.spatial_edge_probs = flat_probs
+        if self.optimized_temporal:
+            self.temporal_edge_probs = flat_probs
     
     def update_memory(self):
         for id,node in self.nodes.items():

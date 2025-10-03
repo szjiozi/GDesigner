@@ -10,7 +10,7 @@ import torch
 import copy
 from typing import List,Union,Literal
 import random
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append("/workspace/juhao/adaptive_agent/GDesigner")
 sys.stdout.reconfigure(encoding='utf-8')
 
 from GDesigner.utils.const import GDesigner_ROOT
@@ -40,7 +40,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="GDesigner Experiments on gsm8k")
     parser.add_argument("--dataset_json", type=str, default="datasets/gsm8k/gsm8k.jsonl")
     parser.add_argument("--result_file", type=str, default=None)
-    parser.add_argument("--llm_name", type=str, default="gpt-4o")
+    parser.add_argument("--llm_name", type=str, default="gpt-4o-mini")
     parser.add_argument('--mode', type=str, default='FullConnected',
                         choices=['DirectAnswer', 'FullConnected', 'Random', 'Chain','Debate','Layered','Star'],
                         help="Mode of operation. Default is 'FullConnected'.")
@@ -58,6 +58,16 @@ def parse_args():
                         help='The decison method of the GDesigner')
     parser.add_argument('--optimized_spatial',action='store_true')
     parser.add_argument('--optimized_temporal',action='store_true')
+    parser.add_argument('--gumbel_tau', type=float, default=1e-2,
+                        help="Gumbel-Softmax temperature for edge sampling.")
+    parser.add_argument('--refine_rank', type=int, default=2,
+                        help="Rank used in the refine module (default uses full rank).")
+    parser.add_argument('--refine_zeta', type=float, default=1e-1,
+                        help="Nuclear norm regularization strength for the refine module.")
+    parser.add_argument('--anchor_weight', type=float, default=1.0,
+                        help="Weight of the anchor loss during training.")
+    parser.add_argument('--sparse_weight', type=float, default=1.0,
+                        help="Weight of the sparse regularization loss during training.")
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -86,9 +96,28 @@ async def main():
                   decision_method=decision_method,
                   optimized_spatial=args.optimized_spatial,
                   optimized_temporal=args.optimized_temporal,
+                  gumbel_tau=args.gumbel_tau,
+                  refine_rank=args.refine_rank,
+                  refine_zeta=args.refine_zeta,
                   **kwargs)
     graph.gcn.train()
-    optimizer = torch.optim.Adam(graph.gcn.parameters(), lr=args.lr)   
+    graph.mlp.train()
+    graph.encoder_mu.train()
+    graph.encoder_logvar.train()
+    graph.ps_linear.train()
+    graph.refine.train()
+    device = next(graph.gcn.parameters()).device
+    trainable_params = []
+    trainable_params += list(graph.gcn.parameters())
+    trainable_params += list(graph.mlp.parameters())
+    trainable_params += list(graph.encoder_mu.parameters())
+    trainable_params += list(graph.encoder_logvar.parameters())
+    trainable_params += list(graph.qs_linear.parameters())
+    trainable_params += list(graph.refine.parameters())
+    optimizer = torch.optim.Adam(trainable_params, lr=args.lr)   
+
+    anchor_weight = args.anchor_weight
+    sparse_weight = args.sparse_weight
     
     num_batches = int(len(dataset)/args.batch_size)
     total_solved, total_executed = (0, 0)
@@ -98,6 +127,7 @@ async def main():
         start_ts = time.time()
         answer_log_probs = []
         answers = []
+        realized_graphs: List[Graph] = []
         
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
@@ -108,6 +138,11 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.gcn = graph.gcn
             realized_graph.mlp = graph.mlp
+            realized_graph.encoder_mu = graph.encoder_mu
+            realized_graph.encoder_logvar = graph.encoder_logvar
+            realized_graph.qs_linear = graph.qs_linear
+            realized_graph.refine = graph.refine
+            realized_graphs.append(realized_graph)
             task = record["task"]
             step = record["step"]
             answer = record["answer"]
@@ -119,8 +154,10 @@ async def main():
         loss_list: List[torch.Tensor] = []
         utilities: List[float] = []
         data = load_result(result_file)
+        anchor_losses: List[torch.Tensor] = []
+        sparse_losses: List[torch.Tensor] = []
         
-        for task, answer, log_prob, true_answer in zip(current_batch, raw_answers, log_probs, answers):
+        for realized_graph, task, answer, log_prob, true_answer in zip(realized_graphs, current_batch, raw_answers, log_probs, answers):
             predict_answer = gsm_get_predict(answer[0])
             is_solved = float(predict_answer)==float(true_answer)
             total_solved = total_solved + is_solved
@@ -130,6 +167,9 @@ async def main():
             utilities.append(utility)
             single_loss = -log_prob * utility
             loss_list.append(single_loss)
+            if hasattr(realized_graph, "refine_losses"):
+                anchor_losses.append(realized_graph.refine_losses.get("L_anchor", torch.tensor(0.0, device=device)).to(device))
+                sparse_losses.append(realized_graph.refine_losses.get("L_sparse", torch.tensor(0.0, device=device)).to(device))
             updated_item = {
                 "Question": task,
                 "Answer": true_answer,
@@ -139,22 +179,32 @@ async def main():
                 "Solved": is_solved,
                 "Total solved": total_solved,
                 "Total executed": total_executed,
-                "Accuracy": accuracy
+                "Accuracy": accuracy,
+                "utility": utility,
+                "anchor_loss": anchor_losses[-1].item(),
+                "sparse_loss": sparse_losses[-1].item(),
             }
             data.append(updated_item)
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)
         
-        total_loss = torch.mean(torch.stack(loss_list))
+        L_utility = torch.mean(torch.stack(loss_list)) if loss_list else torch.tensor(0.0, device=device)
+        L_anchor = torch.mean(torch.stack(anchor_losses)) if anchor_losses else torch.tensor(0.0, device=device)
+        L_sparse = torch.mean(torch.stack(sparse_losses)) if sparse_losses else torch.tensor(0.0, device=device)
+        L_GDesigner = L_utility + anchor_weight * L_anchor + sparse_weight * L_sparse
         if args.optimized_spatial or args.optimized_temporal:
             optimizer.zero_grad()
-            total_loss.backward()
+            L_GDesigner.backward()
             optimizer.step()
         
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)
-        print("loss:", total_loss.item())
+        print("loss:", L_GDesigner.item())
+        print("L_utility:", L_utility.item())
+        print("L_anchor:", L_anchor.item())
+        print("L_sparse:", L_sparse.item())
+        print("L_GDesigner:", L_GDesigner.item())
         
         if i_batch+1 == args.num_iterations:
             args.optimized_spatial = False
@@ -162,6 +212,11 @@ async def main():
             total_solved = 0
             total_executed = 0
             graph.gcn.eval()
+            graph.mlp.eval()
+            graph.encoder_mu.eval()
+            graph.encoder_logvar.eval()
+            graph.ps_linear.eval()
+            graph.refine.eval()
             print("Start Eval")
             
         print(f"Cost {Cost.instance().value}")
