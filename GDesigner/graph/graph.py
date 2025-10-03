@@ -42,7 +42,7 @@ class RefineModule(nn.Module):
         anchor_adj = anchor_adj.to(device=sketch_adj.device, dtype=sketch_adj.dtype)
         Z = self._compute_z(sketch_adj)
         reconstruction = Z @ self.W @ Z.transpose(0, 1)
-        reconstruction = 0.5 * (reconstruction + reconstruction.transpose(0, 1))
+        # reconstruction = 0.5 * (reconstruction + reconstruction.transpose(0, 1))
 
         sparse_residual = sketch_adj - reconstruction
         anchor_residual = anchor_adj - reconstruction
@@ -100,9 +100,9 @@ class Graph(ABC):
                 initial_temporal_probability: float = 0.5,
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
-                gumbel_tau: float = 0.5,
+                gumbel_tau: float = 1e-2,
                 refine_rank: Optional[int] = None,
-                refine_zeta: float = 1e-3,
+                refine_zeta: float = 1e-1,
                 ):
         
         if fixed_spatial_masks is None:
@@ -165,7 +165,7 @@ class Graph(ABC):
         self.latent_dim = 16
         self.gumbel_tau = gumbel_tau
 
-        input_dim = self.features.size(1) * 2
+        input_dim = self.features.size(1)
         self.gcn = GCN(input_dim, self.hidden_dim, self.hidden_dim)
         self.mlp = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim)
         self.encoder_mu = nn.Linear(self.hidden_dim, self.latent_dim)
@@ -251,7 +251,8 @@ class Graph(ABC):
                 query_features.append(query_embedding.clone())
 
         query_feature_tensor = torch.stack(query_features)
-        new_features = torch.cat((self.features, query_feature_tensor), dim=1)
+        new_features = query_feature_tensor
+        # new_features = torch.cat((self.features, query_feature_tensor), dim=1)
         self.tilde_X = new_features
         return new_features
 
