@@ -44,13 +44,13 @@ class RefineModule(nn.Module):
         reconstruction = Z @ self.W @ Z.transpose(0, 1)
         # reconstruction = 0.5 * (reconstruction + reconstruction.transpose(0, 1))
 
-        sparse_residual = sketch_adj - reconstruction
+        sketch_residual = sketch_adj - reconstruction
         anchor_residual = anchor_adj - reconstruction
 
-        L_sparse_recon = 0.5 * torch.norm(sparse_residual, p="fro") ** 2
+        L_sketch_recon = 0.5 * torch.norm(sketch_residual, p="fro") ** 2
         nuclear_norm = torch.linalg.svdvals(self.W).sum()
-        L_sparse = L_sparse_recon + self.zeta * nuclear_norm
-        L_anchor = 0.5 * torch.norm(anchor_residual, p="fro") ** 2
+        L_sparse = self.zeta * nuclear_norm
+        L_anchor = 0.5 * torch.norm(anchor_residual, p="fro") ** 2 + L_sketch_recon
         L_total = L_sparse + L_anchor
 
         losses = {
@@ -170,7 +170,7 @@ class Graph(ABC):
         self.mlp = MLP(self.hidden_dim, self.hidden_dim, self.hidden_dim)
         self.encoder_mu = nn.Linear(self.hidden_dim, self.latent_dim)
         self.encoder_logvar = nn.Linear(self.hidden_dim, self.latent_dim)
-        self.qs_linear = nn.Linear(self.latent_dim, self.latent_dim)
+        self.ps_linear = nn.Linear(self.latent_dim, self.latent_dim)
         self.refine = RefineModule(self.num_nodes, rank=refine_rank, zeta=refine_zeta)
         self.refine_losses: Dict[str, torch.Tensor] = {
             "L_anchor": torch.tensor(0.0),
@@ -536,10 +536,10 @@ class Graph(ABC):
         eps = torch.randn_like(std)
         return mu + eps * std
 
-    def qs(self, latent: torch.Tensor, tau: float) -> torch.Tensor:
-        transformed = self.qs_linear(latent)
+    def ps(self, latent: torch.Tensor, tau: float) -> torch.Tensor:
+        transformed = self.ps_linear(latent)
         similarity = torch.matmul(transformed, transformed.transpose(0, 1))
-        if self.qs_linear.training:
+        if self.ps_linear.training:
             gumbel_noise = -torch.log(-torch.log(torch.rand_like(similarity) + 1e-9) + 1e-9)
             logits = (similarity + gumbel_noise) / tau
             return torch.sigmoid(logits)
@@ -554,7 +554,7 @@ class Graph(ABC):
     def prepare_probabilities(self, query: str) -> None:
         self.mu, self.logvar = self.encode(query)
         self.latent_z = self.reparameterize(self.mu, self.logvar)
-        sketch_adj = self.qs(self.latent_z, self.gumbel_tau)
+        sketch_adj = self.ps(self.latent_z, self.gumbel_tau)
         self.tilde_S = self.qc(sketch_adj)
         flat_probs = torch.clamp(self.tilde_S, min=1e-6, max=1 - 1e-6).reshape(-1)
         self.spatial_edge_probs = flat_probs
