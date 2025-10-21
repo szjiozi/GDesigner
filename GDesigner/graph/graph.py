@@ -221,7 +221,7 @@ class Graph(ABC):
         self.encoder_mu.train()
         self.encoder_logvar.train()
         self.ps_linear.train()
-        self.refine.train()
+        # self.refine.train()
     
     def eval(self):
         self.gcn.eval()
@@ -229,7 +229,7 @@ class Graph(ABC):
         self.encoder_mu.eval()
         self.encoder_logvar.eval()
         self.ps_linear.eval()
-        self.refine.eval()
+        # self.refine.eval()
 
     def construct_adj_matrix(self):
         role_connect:List[Tuple[str,str]] = self.prompt_set.get_role_connection()
@@ -358,6 +358,12 @@ class Graph(ABC):
         for node in self.nodes.values():
             num_edges += len(node.spatial_successors)
         return num_edges
+    
+    @property
+    def edge_reward(self):
+        e_current = (self.spatial_adj_matrix==1.0).sum()
+        e_full = self.num_nodes * (self.num_nodes - 1)
+        return (e_full - e_current)/e_full
     
     @property
     def num_nodes(self):
@@ -645,7 +651,7 @@ class Graph(ABC):
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
-        return final_answers, log_probs
+        return final_answers, log_probs, self.edge_reward
 
     def encode(self, query: str) -> Tuple[torch.Tensor, torch.Tensor]:
         new_features = self.construct_new_features(query)
@@ -695,7 +701,7 @@ class Graph(ABC):
 
         raw_w = self.ps_linear(x).squeeze(-1)
         w = 5.0*torch.tanh(raw_w/5.0)
-        edge_probs = self._gumbel_sigmoid(w, tau=tau)
+        edge_probs = self._gumbel_sigmoid(w, tau=tau, hard=True)
         if not torch.isfinite(edge_probs).all():
             print(f"[NaNGuard] edge_probs has NaN/Inf")
         if not torch.isfinite(w).all():
@@ -730,8 +736,8 @@ class Graph(ABC):
         if not torch.isfinite(self.latent_z).all():
             print(f"[NaNGuard] latent_z has NaN/Inf")
         sketch_adj = self.ps(self.latent_z, self.gumbel_tau)
-        self.tilde_S = self.qc(sketch_adj)
-        flat_probs = self.tilde_S.reshape(-1)
+        # self.tilde_S = self.qc(sketch_adj)
+        flat_probs = sketch_adj.reshape(-1)
         if self.optimized_spatial:
             self.spatial_probs = flat_probs
         # if self.optimized_temporal:

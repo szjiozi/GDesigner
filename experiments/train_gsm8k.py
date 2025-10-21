@@ -156,6 +156,7 @@ async def main():
     sparse_weight = args.sparse_weight
     
     num_batches = int(len(dataset)/args.batch_size)
+    group_size = args.group_size
     
     for i_batch in range(num_batches):
         if executed_batch:
@@ -166,13 +167,13 @@ async def main():
                     total_solved = 0
                     total_executed = 0
                     graph.eval()
-                    print("Start Eval")
+                    # print("Start Eval")
+                    break
                 continue
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()
         answer_log_probs = []
         answers = []
-        realized_graphs: List[Graph] = []
         
         current_batch = dataloader(dataset,args.batch_size,i_batch)
         if current_batch is None:
@@ -180,35 +181,27 @@ async def main():
             break
         
         for i_record, record in enumerate(current_batch):
-            realized_graph = copy.deepcopy(graph)
-            realized_graph.gcn = graph.gcn
-            realized_graph.mlp = graph.mlp
-            realized_graph.encoder_mu = graph.encoder_mu
-            realized_graph.encoder_logvar = graph.encoder_logvar
-            realized_graph.ps_linear = graph.ps_linear
-            realized_graph.refine = graph.refine
-            realized_graphs.append(realized_graph)
             task = record["task"]
             step = record["step"]
             answer = record["answer"]
             answers.append(answer)
             input_dict = {"task": task}
-            answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,args.num_rounds)))
+            answer_log_probs.append(asyncio.create_task(graph.arun(input_dict,args.num_rounds)))
+            graph.save_result(result_dir, str(total_executed + i_record))
         raw_results = await asyncio.gather(*answer_log_probs)
-        raw_answers, log_probs = zip(*raw_results)
+        raw_answers, log_probs, edge_rewards = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         rewards = List[float] = []
         utilities: List[float] = []
         data = load_result(result_file)
         
-        for realized_graph, task, answer, log_prob, true_answer in zip(realized_graphs, current_batch, raw_answers, log_probs, answers):
+        for task, answer, log_prob, true_answer, edge_reward in zip(current_batch, raw_answers, log_probs, answers, edge_rewards):
             predict_answer = gsm_get_predict(answer[0])
             is_solved = float(predict_answer)==float(true_answer)
             total_solved = total_solved + is_solved
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
             utility = is_solved
-            edge_reward = realized_graph.edge_reward()
             reward = utility + utility * edge_reward
             utilities.append(utility)
             rewards.append(reward)
@@ -231,7 +224,6 @@ async def main():
                 "completion_tokens": CompletionTokens.instance().value,
             }
             data.append(updated_item)
-            realized_graph.save_result(result_dir, str(total_executed))
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)
         
@@ -262,7 +254,8 @@ async def main():
             total_solved = 0
             total_executed = 0
             graph.eval()
-            print("Start Eval")
+            # print("Start Eval")
+            break
             
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")

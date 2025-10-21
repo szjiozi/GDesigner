@@ -75,6 +75,8 @@ def parse_args():
                         help="Directory to save the graph.")
     parser.add_argument('--experiment_name', type=str, default=None,
                         help="Name of the experiment.")
+    parser.add_argument('--group_size', type=int, default=10,
+                        help="Group size for the training.")
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -195,10 +197,9 @@ async def main():
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
+        rewards = List[float] = []
         utilities: List[float] = []
         data = load_result(result_file)
-        anchor_losses: List[torch.Tensor] = []
-        sparse_losses: List[torch.Tensor] = []
         
         for realized_graph, task, answer, log_prob, true_answer in zip(realized_graphs, current_batch, raw_answers, log_probs, answers):
             predict_answer = gsm_get_predict(answer[0])
@@ -207,12 +208,12 @@ async def main():
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
             utility = is_solved
+            edge_reward = realized_graph.edge_reward()
+            reward = utility + utility * edge_reward
             utilities.append(utility)
-            single_loss = -log_prob * utility
+            rewards.append(reward)
+            single_loss = -log_prob * reward
             loss_list.append(single_loss)
-            if hasattr(realized_graph, "refine_losses"):
-                anchor_losses.append(realized_graph.refine_losses.get("L_anchor", torch.tensor(0.0, device=device)).to(device))
-                sparse_losses.append(realized_graph.refine_losses.get("L_sparse", torch.tensor(0.0, device=device)).to(device))
             updated_item = {
                 "Question": task,
                 "Answer": true_answer,
@@ -224,8 +225,7 @@ async def main():
                 "Total executed": total_executed,
                 "Accuracy": accuracy,
                 "utility": utility,
-                "anchor_loss": anchor_losses[-1].item(),
-                "sparse_loss": sparse_losses[-1].item(),
+                "reward": reward,
                 "cost": Cost.instance().value,
                 "prompt_tokens": PromptTokens.instance().value,
                 "completion_tokens": CompletionTokens.instance().value,
@@ -236,14 +236,11 @@ async def main():
             json.dump(data, file, indent=4)
         
         L_utility = torch.mean(torch.stack(loss_list)) if loss_list else torch.tensor(0.0, device=device)
-        L_anchor = torch.mean(torch.stack(anchor_losses)) if anchor_losses else torch.tensor(0.0, device=device)
-        L_sparse = torch.mean(torch.stack(sparse_losses)) if sparse_losses else torch.tensor(0.0, device=device)
-        L_GDesigner = L_utility + anchor_weight * L_anchor + sparse_weight * L_sparse
-        if not torch.isfinite(L_GDesigner):
-            print(f"[NaNGuard] L_GDesigner has NaN/Inf")
+        if not torch.isfinite(L_utility):
+            print(f"[NaNGuard] L_utility has NaN/Inf")
         if args.optimized_spatial or args.optimized_temporal:
             optimizer.zero_grad()
-            L_GDesigner.backward()
+            L_utility.backward()
             for model_name, model in trainable_models.items():
                 for name, p in model.named_parameters():
                     if p.grad is not None and not torch.isfinite(p.grad).all():
@@ -254,11 +251,8 @@ async def main():
         print(f"Batch time {time.time() - start_ts:.3f}")
         print(f"Accuracy: {accuracy}")
         print("utilities:", utilities)
-        print("loss:", L_GDesigner.item())
-        print("L_utility:", L_utility.item())
-        print("L_anchor:", L_anchor.item())
-        print("L_sparse:", L_sparse.item())
-        print("L_GDesigner:", L_GDesigner.item())
+        print("loss:", L_utility.item())
+        print("rewards:", rewards)
         
         if i_batch+1 == args.num_iterations:
             if args.to_graph_dir:
