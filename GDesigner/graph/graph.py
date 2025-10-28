@@ -651,7 +651,7 @@ class Graph(ABC):
         final_answers = self.decision_node.outputs
         if len(final_answers) == 0:
             final_answers.append("No answer of the decision node")
-        return final_answers, log_probs, self.edge_reward
+        return final_answers, log_probs
 
     def encode(self, query: str) -> Tuple[torch.Tensor, torch.Tensor]:
         new_features = self.construct_new_features(query)

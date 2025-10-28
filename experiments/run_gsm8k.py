@@ -197,7 +197,7 @@ async def main():
         raw_results = await asyncio.gather(*answer_log_probs)
         raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
-        rewards = List[float] = []
+        rewards: List[float] = []
         utilities: List[float] = []
         data = load_result(result_file)
         
@@ -208,7 +208,7 @@ async def main():
             total_executed = total_executed + 1
             accuracy = total_solved/ total_executed
             utility = is_solved
-            edge_reward = realized_graph.edge_reward()
+            edge_reward = realized_graph.edge_reward
             reward = utility + utility * edge_reward
             utilities.append(utility)
             rewards.append(reward)
