@@ -10,7 +10,6 @@ import torch
 import copy
 from typing import List,Union,Literal
 import random
-import numpy as np
 sys.path.append("/workspace/juhao/adaptive_agent/GDesigner")
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -136,6 +135,11 @@ async def main():
             refine_zeta=args.refine_zeta,
             **kwargs
         )
+        if executed_batch > args.num_iterations*args.group_size:
+            executed_batch = args.num_iterations+executed_batch-args.num_iterations*args.group_size
+        else:
+            executed_batch /= args.group_size
+        result_dir = result_dir / "eval"
     else:
         graph = Graph(domain="gsm8k",
                     llm_name=args.llm_name,
@@ -167,8 +171,7 @@ async def main():
                     total_solved = 0
                     total_executed = 0
                     graph.eval()
-                    # print("Start Eval")
-                    break
+                    print("Start Eval")
                 continue
         print(f"Batch {i_batch}",80*'-')
         start_ts = time.time()
@@ -182,72 +185,58 @@ async def main():
             break
         
         for i_record, record in enumerate(current_batch):
-            group_realized_graphs: List[Graph] = []
+            realized_graph = copy.deepcopy(graph)
+            realized_graph.gcn = graph.gcn
+            realized_graph.mlp = graph.mlp
+            realized_graph.encoder_mu = graph.encoder_mu
+            realized_graph.encoder_logvar = graph.encoder_logvar
+            realized_graph.ps_linear = graph.ps_linear
+            realized_graph.refine = graph.refine
+            realized_graphs.append(realized_graph)
             task = record["task"]
             step = record["step"]
             answer = record["answer"]
             answers.append(answer)
             input_dict = {"task": task}
-            for _ in range(args.group_size):
-                realized_graph = copy.deepcopy(graph)
-                realized_graph.gcn = graph.gcn
-                realized_graph.mlp = graph.mlp
-                realized_graph.encoder_mu = graph.encoder_mu
-                realized_graph.encoder_logvar = graph.encoder_logvar
-                realized_graph.ps_linear = graph.ps_linear
-                realized_graph.refine = graph.refine
-                group_realized_graphs.append(realized_graph)
-                answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,args.num_rounds)))
-            realized_graphs.append(group_realized_graphs)
+            answer_log_probs.append(asyncio.create_task(realized_graph.arun(input_dict,args.num_rounds)))
         raw_results = await asyncio.gather(*answer_log_probs)
-        _raw_answers, _log_probs = zip(*raw_results)
-        raw_answers = [_raw_answers[i: i+args.group_size] for i in range(0, len(_raw_answers), args.group_size)]
-        log_probs = [_log_probs[i: i+args.group_size] for i in range(0, len(_log_probs), args.group_size)]
+        raw_answers, log_probs = zip(*raw_results)
         loss_list: List[torch.Tensor] = []
         rewards: List[float] = []
         utilities: List[float] = []
         data = load_result(result_file)
         
         for realized_graph, task, answer, log_prob, true_answer in zip(realized_graphs, current_batch, raw_answers, log_probs, answers):
-            group_rewards = []
-            group_updated_items = []
-            for i in range(args.group_size):
-                _graph = realized_graph[i]
-                predict_answer = gsm_get_predict(answer[i][0])
-                is_solved = float(predict_answer)==float(true_answer)
-                total_solved = total_solved + is_solved
-                total_executed = total_executed + 1
-                accuracy = total_solved/ total_executed
-                utility = is_solved
-                edge_reward = _graph.edge_reward
-                reward = utility + utility * edge_reward
-                group_rewards.append(reward)
-                _graph.save_result(result_dir, str(total_executed))
-                utilities.append(utility)
-                updated_item = {
-                    "Question": task,
-                    "Answer": true_answer,
-                    "Step": step,
-                    "Response": answer[i],
-                    "Attempt answer": predict_answer,
-                    "Solved": is_solved,
-                    "Total solved": total_solved,
-                    "Total executed": total_executed,
-                    "Accuracy": accuracy,
-                    "utility": utility,
-                    "reward": reward,
-                    "cost": Cost.instance().value,
-                    "prompt_tokens": PromptTokens.instance().value,
-                    "completion_tokens": CompletionTokens.instance().value,
-                }
-                group_updated_items.append(updated_item)
-            for i in range(args.group_size):
-                reward = (group_rewards[i]-np.mean(group_rewards))/(np.std(group_rewards)+1e-6)
-                rewards.append(reward)
-                single_loss = -log_prob[i] * reward
-                loss_list.append(single_loss)
-                group_updated_items[i].update({"reward": reward})
-            data.extend(group_updated_items)
+            predict_answer = gsm_get_predict(answer[0])
+            is_solved = float(predict_answer)==float(true_answer)
+            total_solved = total_solved + is_solved
+            total_executed = total_executed + 1
+            accuracy = total_solved/ total_executed
+            utility = is_solved
+            edge_reward = realized_graph.edge_reward
+            reward = utility + utility * edge_reward
+            utilities.append(utility)
+            rewards.append(reward)
+            single_loss = -log_prob * reward
+            loss_list.append(single_loss)
+            updated_item = {
+                "Question": task,
+                "Answer": true_answer,
+                "Step": step,
+                "Response": answer,
+                "Attempt answer": predict_answer,
+                "Solved": is_solved,
+                "Total solved": total_solved,
+                "Total executed": total_executed,
+                "Accuracy": accuracy,
+                "utility": utility,
+                "reward": reward,
+                "cost": Cost.instance().value,
+                "prompt_tokens": PromptTokens.instance().value,
+                "completion_tokens": CompletionTokens.instance().value,
+            }
+            data.append(updated_item)
+            realized_graph.save_result(result_dir, str(total_executed))
         with open(result_file, 'w',encoding='utf-8') as file:
             json.dump(data, file, indent=4)
         
@@ -278,8 +267,7 @@ async def main():
             total_solved = 0
             total_executed = 0
             graph.eval()
-            # print("Start Eval")
-            break
+            print("Start Eval")
             
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
