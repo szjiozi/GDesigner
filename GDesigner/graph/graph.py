@@ -221,6 +221,7 @@ class Graph(ABC):
         self.encoder_mu.train()
         self.encoder_logvar.train()
         self.ps_linear.train()
+        self.train = True
         # self.refine.train()
     
     def eval(self):
@@ -229,6 +230,7 @@ class Graph(ABC):
         self.encoder_mu.eval()
         self.encoder_logvar.eval()
         self.ps_linear.eval()
+        self.train = False
         # self.refine.eval()
 
     def construct_adj_matrix(self):
@@ -701,7 +703,10 @@ class Graph(ABC):
 
         raw_w = self.ps_linear(x).squeeze(-1)
         w = 5.0*torch.tanh(raw_w/5.0)
-        edge_probs = self._gumbel_sigmoid(w, tau=tau, hard=True)
+        if self.train:
+            edge_probs = self._gumbel_sigmoid(w, tau=tau, hard=False)
+        else:
+            edge_probs = self._gumbel_sigmoid(w, tau=tau, hard=True)
         if not torch.isfinite(edge_probs).all():
             print(f"[NaNGuard] edge_probs has NaN/Inf")
         if not torch.isfinite(w).all():

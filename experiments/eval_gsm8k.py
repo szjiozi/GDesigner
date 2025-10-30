@@ -77,6 +77,7 @@ def parse_args():
                         help="Name of the experiment.")
     parser.add_argument('--group_size', type=int, default=10,
                         help="Group size for the training.")
+    parser.add_argument("--dataset_json_with_difficulty", type=str, default=None)
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -88,8 +89,11 @@ def parse_args():
 async def main():
     args = parse_args()
     result_file = None
-    dataset = JSONLReader.parse_file(args.dataset_json)
-    dataset = gsm_data_process(dataset)
+    if args.dataset_json_with_difficulty:
+        dataset = JSONLReader.parse_file(args.dataset_json_with_difficulty)
+    else:
+        dataset = JSONLReader.parse_file(args.dataset_json)
+        dataset = gsm_data_process(dataset)
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
     executed_batch = None
@@ -272,6 +276,8 @@ async def main():
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
+        if total_executed >= 300:
+            break
 
 def get_kwargs(mode:Union[Literal['DirectAnswer'],Literal['FullConnected'],Literal['Random'],Literal['Chain'],Literal['Debate'],Literal['Layered'],Literal['Star']]
                ,N:int):
