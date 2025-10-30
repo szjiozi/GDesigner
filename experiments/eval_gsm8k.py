@@ -143,6 +143,7 @@ async def main():
             executed_batch = args.num_iterations+executed_batch-args.num_iterations*args.group_size
         else:
             executed_batch /= args.group_size
+            total_solved, total_executed = (0, 0)
         result_dir = result_dir / "eval"
     else:
         graph = Graph(domain="gsm8k",
@@ -172,8 +173,8 @@ async def main():
                 if i_batch+1 == args.num_iterations:
                     args.optimized_spatial = False
                     args.optimized_temporal = False
-                    total_solved = 0
-                    total_executed = 0
+                    # total_solved = 0
+                    # total_executed = 0
                     graph.eval()
                     print("Start Eval")
                 continue
@@ -276,8 +277,8 @@ async def main():
         print(f"Cost {Cost.instance().value}")
         print(f"PromptTokens {PromptTokens.instance().value}")
         print(f"CompletionTokens {CompletionTokens.instance().value}")
-        if total_executed >= 300:
-            break
+        # if total_executed >= 300:
+        #     break
 
 def get_kwargs(mode:Union[Literal['DirectAnswer'],Literal['FullConnected'],Literal['Random'],Literal['Chain'],Literal['Debate'],Literal['Layered'],Literal['Star']]
                ,N:int):

@@ -79,6 +79,7 @@ def parse_args():
     parser.add_argument('--group_size', type=int, default=10,
                         help="Group size for the training.")
     parser.add_argument("--dataset_json_with_difficulty", type=str, default=None)
+    parser.add_argument('--use_std',action='store_true')
     args = parser.parse_args()
     result_path = GDesigner_ROOT / "result"
     os.makedirs(result_path, exist_ok=True)
@@ -246,7 +247,10 @@ async def main():
                 }
                 group_updated_items.append(updated_item)
             for i in range(args.group_size):
-                reward = (group_rewards[i]-np.mean(group_rewards))/(np.std(group_rewards)+1e-6)
+                if args.use_std:
+                    reward = (group_rewards[i]-np.mean(group_rewards))/(np.std(group_rewards)+1e-6)
+                else:
+                    reward = (group_rewards[i]-np.mean(group_rewards))
                 rewards.append(reward)
                 single_loss = -log_prob[i] * reward
                 loss_list.append(single_loss)
